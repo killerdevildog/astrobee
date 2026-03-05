@@ -44,6 +44,7 @@
 
 // STL includes
 #include <string>
+#include <vector>
 
 namespace gazebo {
 
@@ -137,6 +138,19 @@ class GazeboSensorPluginHandrailDetect : public FreeFlyerSensorPlugin {
     return true;
   }
 
+  // Cache model indices with handrail in name, and refresh when model count changes.
+  void RefreshHandrailModelIndices() {
+    handrail_model_indices_.clear();
+    const size_t model_count = GetWorld()->GetModelCount();
+    handrail_model_indices_.reserve(model_count);
+    for (size_t i = 0; i < model_count; ++i) {
+      const physics::ModelPtr model = GetWorld()->GetModel(i);
+      if (model->GetName().find("handrail") != std::string::npos)
+        handrail_model_indices_.push_back(i);
+    }
+    cached_world_model_count_ = model_count;
+  }
+
 
   // Send a registration pulse
   void SendRegistration(ros::TimerEvent const& event) {
@@ -178,23 +192,24 @@ class GazeboSensorPluginHandrailDetect : public FreeFlyerSensorPlugin {
           sensor_->Pose().Rot().Y(),
           sensor_->Pose().Rot().Z()));
     Eigen::Affine3d wTc = wTb * bTc;
+    const Eigen::Affine3d cTw = wTc.inverse();
 
     // Initialize the camera paremeters
     static camera::CameraParameters cam_params(&config_, "perch_cam");
     static camera::CameraModel camera(Eigen::Vector3d(0, 0, 0),
       Eigen::Matrix3d::Identity(), cam_params);
 
-    // Look for all models with the name "handrail". This will find every
-    // handrail of every size that exists in the gazebo simulation
+    // Look for all models with the name "handrail". Rebuild the index cache
+    // only when the world model count changes; otherwise reuse it.
+    const size_t world_model_count = GetWorld()->GetModelCount();
+    if (world_model_count != cached_world_model_count_ || handrail_model_indices_.empty())
+      RefreshHandrailModelIndices();
+
     physics::ModelPtr closest_model = nullptr;
     double closest_distance = 0.0;
     Eigen::Affine3d closest_pose = Eigen::Affine3d::Identity();
-    for (size_t i = 0; i < GetWorld()->GetModelCount(); i++) {
-      // Find only models with "handrail" in their name
-      physics::ModelPtr model = GetWorld()->GetModel(i);
-      // Determine the handrail based on the name
-      if (model->GetName().find("handrail") == std::string::npos)
-        continue;
+    for (const size_t model_index : handrail_model_indices_) {
+      physics::ModelPtr model = GetWorld()->GetModel(model_index);
       // Get the handrail to world transform
       Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
       q.x() = model->GetWorldPose().rot.x;
@@ -206,16 +221,12 @@ class GazeboSensorPluginHandrailDetect : public FreeFlyerSensorPlugin {
       wTh.translation()[1] = model->GetWorldPose().pos.y;
       wTh.translation()[2] = model->GetWorldPose().pos.z;
       wTh.linear() = q.toRotationMatrix();
-      // Handrail to camera frame
-      Eigen::Affine3d cTh =  wTc.inverse() * wTh;
-      // Check if the handrail center is in view. A consequence of this is that
-      // the center of the handrail must be in view in order to be detected.
+      // Transform handrail into camera frame using the pre-computed inverse.
+      Eigen::Affine3d cTh = cTw * wTh;
+      // Check if the handrail center is in view.
       if (!camera.IsInFov(cTh.translation()))
         continue;
-      // Get the distance between the robot and
       double distance = cTh.translation().norm();
-      // It is in theory possible to hav multiple handrails detected, so we
-      // will only use the closest handrail, as measured by Euclidean distance.
       if (closest_model == nullptr || distance < closest_distance) {
         closest_model = model;
         closest_distance = distance;
@@ -300,7 +311,7 @@ class GazeboSensorPluginHandrailDetect : public FreeFlyerSensorPlugin {
 
         // Calculate the point
         Eigen::Vector3d p_w = n_w + dist * (f_w - n_w).normalized();
-        Eigen::Vector3d p_c = wTc.inverse() * p_w;
+        Eigen::Vector3d p_c = cTw * p_w;
         Eigen::Vector2d p_i = camera.ImageCoordinates(p_c);
 
         // Create the landmark message
@@ -337,6 +348,8 @@ class GazeboSensorPluginHandrailDetect : public FreeFlyerSensorPlugin {
   double far_clip_;
   unsigned int num_features_;
   unsigned int num_samp_;
+  size_t cached_world_model_count_ = 0;
+  std::vector<size_t> handrail_model_indices_;
 };
 
 GZ_REGISTER_SENSOR_PLUGIN(GazeboSensorPluginHandrailDetect)
